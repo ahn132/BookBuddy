@@ -12,6 +12,7 @@ import os
 import pdfplumber
 import re
 from collections import defaultdict
+from embeddings import TextEmbedder
 
 models.Base.metadata.create_all(bind=engine)
 
@@ -28,6 +29,9 @@ app.add_middleware(
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), 'uploads')
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Initialize the text embedder
+text_embedder = TextEmbedder()
 
 class UserCreate(BaseModel):
     email: str
@@ -209,9 +213,10 @@ def extract_chapters(pdf_path: str):
 @app.post("/admin/upload-pdf")
 async def upload_pdf(
     file: UploadFile = File(...),
-    current_user: models.User = Depends(get_current_admin)
+    current_user: models.User = Depends(get_current_admin),
+    db: Session = Depends(get_db)
 ):
-    """Upload a PDF file and parse its chapters."""
+    """Upload a PDF file, parse its chapters, and store them in Pinecone."""
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed")
     
@@ -228,13 +233,40 @@ async def upload_pdf(
         # Extract chapters
         chapters = extract_chapters(file_path)
         
-        # Print chapter information
-        print("\nExtracted Chapters:")
-        for chapter in chapters:
-            print(f"\nChapter: {chapter['title']}")
-            print("Content preview:", chapter['content'][:200] + "...")
+        # Create a new book entry in the database
+        book = models.Book(
+            title=file.filename.replace('.pdf', ''),
+            author="Unknown",  # You might want to extract this from the PDF
+            file_path=file_path,
+            owner_id=current_user.id
+        )
+        db.add(book)
+        db.commit()
+        db.refresh(book)
         
-        return {"message": "PDF uploaded and parsed successfully", "chapters": chapters}
+        # Process each chapter and store in Pinecone
+        total_chunks = 0
+        for i, chapter in enumerate(chapters):
+            # Store chapter in database
+            db_chapter = models.Chapter(
+                title=chapter['title'],
+                content=chapter['content'],
+                chapter_number=i + 1,
+                book_id=book.id
+            )
+            db.add(db_chapter)
+            
+            # Process chapter with text embedder
+            num_chunks = text_embedder.process_book_chapter(chapter['content'], chapter['title'])
+            total_chunks += num_chunks
+        
+        db.commit()
+        
+        return {
+            "message": "PDF uploaded and processed successfully",
+            "chapters": len(chapters),
+            "total_chunks": total_chunks
+        }
     except Exception as e:
         print(f"Error processing PDF: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
